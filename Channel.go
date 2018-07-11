@@ -1,0 +1,233 @@
+package sock
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"net"
+	"strings"
+	"sync/atomic"
+	"time"
+)
+
+// Channel is websocket route
+type (
+	Channel struct {
+		connMap  *connMap
+		subscrs  *subscrMap
+		readers  *readersMap
+		requests *requestsMap
+		closeCh  chan bool
+		closed   bool
+	}
+
+	messageStruct struct {
+		Message   []byte
+		RequestID int64
+	}
+)
+
+var (
+	nextConnID uint64
+	receive    uint64
+	sent       uint64
+	receiveOld uint64
+	sentOld    uint64
+)
+
+func init() {
+	go func() {
+		for range time.Tick(time.Second) {
+			if receive != receiveOld || sent != sentOld {
+				println("... receive:", receive, "sent:", sent)
+				sentOld = sent
+				receiveOld = receive
+			}
+		}
+	}()
+}
+
+func newChannel() *Channel {
+	return &Channel{
+		connMap:  newConnMap(),
+		subscrs:  newSubscrMap(),
+		readers:  newReaderMap(),
+		requests: newRequestsMap(),
+		closeCh:  make(chan bool),
+	}
+}
+
+// tokay websocket handler
+func (channel *Channel) handler(conn net.Conn) {
+	if channel.closed {
+		return
+	}
+	connection := newConnection(atomic.AddUint64(&nextConnID, 1), channel, conn)
+	channel.subscribeReader()
+	go func() {
+		if fns, exists := channel.readers.GetEx("ws-server-connect"); exists {
+			adapter := newAdapter("ws-server-connect", connection, nil, 0)
+			for _, fn := range fns {
+				fn(adapter)
+			}
+		}
+	}()
+	channel.readLoop(conn, connection)
+	go func() {
+		if fns, exists := channel.readers.GetEx("ws-server-disconnect"); exists {
+			adapter := newAdapter("ws-server-disconnect", connection, nil, 0)
+			for _, fn := range fns {
+				fn(adapter)
+			}
+		}
+	}()
+	connection.Close()
+}
+
+func bufRead(r *bufio.Reader, n int) ([]byte, error) {
+	buf := make([]byte, 0, n)
+	for i := 0; i < n; i++ {
+		b, err := r.ReadByte()
+		if err != nil {
+			return []byte{}, err
+		}
+		buf = append(buf, b)
+	}
+	// fmt.Println(n, string(buf), len(buf))
+	return buf, nil
+}
+
+func (channel *Channel) readLoop(conn net.Conn, connection *Connection) {
+	r := bufio.NewReader(conn)
+	for {
+		resultCh := make(chan *messageStruct)
+
+		go func() {
+			header, err := bufRead(r, 12)
+			if err != nil {
+				return
+			}
+			msgLen := binary.LittleEndian.Uint32(header[:4])
+			requestID := int64(binary.LittleEndian.Uint64(header[4:12]))
+
+			data, err := bufRead(r, int(msgLen))
+
+			if err != nil {
+				return
+			}
+			atomic.AddUint64(&receive, 1)
+			// fmt.Println(msgLen, requestID, string(data))
+			resultCh <- &messageStruct{data, requestID}
+		}()
+
+		select {
+		case result := <-resultCh:
+			go func(message *messageStruct) {
+				var result = bytes.SplitN(message.Message, []byte(":"), 2)
+				if len(result) == 2 {
+					requestID := message.RequestID
+					command := string(result[0])
+					data := result[1]
+					fmt.Println(":::>", requestID, command, string(data), "<:::")
+					if requestID < 0 { // answer to the request from server
+						if fn, ex := channel.requests.GetEx(requestID); ex {
+							fn(newAdapter(command, connection, &data, requestID))
+							channel.requests.Delete(requestID)
+						}
+					} else if fns, exists := channel.readers.GetEx(command); exists {
+						adapter := newAdapter(command, connection, &data, requestID)
+						for _, fn := range fns {
+							fn(adapter)
+						}
+					}
+				}
+			}(result)
+		case channel.closed = <-channel.closeCh:
+			return
+		}
+	}
+}
+
+// Read is client message (request) handler
+func (channel *Channel) Read(command string, fn func(*Adapter)) {
+	channel.readers.Set(command, fn)
+}
+
+// AddConnectFunc add new Connect handler
+func (channel *Channel) AddConnectFunc(fn func(a *Adapter)) {
+	channel.readers.Set("ws-server-connect", fn)
+}
+
+// AddDisconnectFunc add new Disconnect handler
+func (channel *Channel) AddDisconnectFunc(fn func(a *Adapter)) {
+	channel.readers.Set("ws-server-disconnect", fn)
+}
+
+// Close ws instance connections
+func (channel *Channel) Close() {
+	go func() { channel.closeCh <- true }()
+	cs := channel.connMap.Copy()
+	for _, v := range cs {
+		v.Close()
+	}
+}
+
+// Connection by ID (or empty closed if not found)
+func (channel *Channel) Connection(connID uint64) *Connection {
+	connection, ok := channel.connMap.GetEx(connID)
+	if !ok {
+		connection = emptyConnection()
+	}
+	return connection
+}
+
+// Send message to open connections
+func (channel *Channel) Send(command string, message interface{}) error {
+	errStr := ""
+	for _, connection := range channel.connMap.Copy() {
+		if err := connection.Send(command, message); err != nil {
+			errStr += fmt.Sprintf("Connect %d: %v/n", connection.ID(), err)
+		}
+	}
+	if errStr != "" {
+		return errors.New(errStr)
+	}
+	return nil
+}
+
+// Subscribers of commands ("command1,command2" etc.)
+func (channel *Channel) Subscribers(commands string) Connections {
+	ret := newConnections()
+	for _, v := range strings.Split(commands, ",") {
+		if v, ok := channel.subscrs.GetEx(strings.TrimSpace(v)); ok {
+			for _, connection := range v.Copy() {
+				ret.Add(connection)
+			}
+		}
+	}
+	return ret
+}
+
+func (channel *Channel) subscribeReader() {
+	channel.Read("subscribe", func(a *Adapter) {
+		command := a.StringData()
+		a.Connection().Subscribe(command)
+	})
+}
+
+// GetConnects from Channel
+func (channel *Channel) GetConnects() (connectIDs map[uint64]*Connection) {
+	return channel.connMap.Copy()
+}
+
+// Count of connections
+func (channel *Channel) Count() int {
+	return channel.connMap.Len()
+}
+
+// UsersCount is count of users
+func (channel *Channel) UsersCount() int {
+	return channel.connMap.Len()
+}
